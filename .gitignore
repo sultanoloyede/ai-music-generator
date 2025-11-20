@@ -1,0 +1,8 @@
+# Python venv
+backend/.venv/
+
+# Node modules
+frontend/node_modules/
+
+# OS junk
+.DS_Store
