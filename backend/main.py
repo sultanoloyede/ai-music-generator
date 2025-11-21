@@ -13,7 +13,7 @@ backend_dir = Path(__file__).parent
 # Create image with all dependencies
 image = (
     modal.Image.debian_slim()
-    .apt_install("git")
+    .apt_install("git", "libsndfile1", "ffmpeg")  # Audio dependencies
     .pip_install(
         "boto3",
         "transformers==4.50.0",
@@ -21,7 +21,9 @@ image = (
         "torch==2.5.1",
         "accelerate==1.6.0",
         "peft==0.14.0",
-        "fastapi==0.115.0"
+        "fastapi==0.115.0",
+        "soundfile",  # Audio backend for torchaudio
+        "torchcodec"
     )
     .run_commands([
         "git clone https://github.com/ace-step/ACE-Step.git /tmp/ACE-Step",
@@ -165,6 +167,84 @@ class MusicGenServer:
         categories = [cat.strip() for cat in response.split(",") if cat.strip()]
         return categories[:5]
 
+    def generate_and_upload_to_s3(
+        self,
+        prompt: str,
+        lyrics: str,
+        instrumental: bool,
+        audio_duration: float,
+        infer_step: int,
+        guidance_scale: float,
+        seed: int,
+        description_for_categorization: str
+    ) -> GenerateMusicResponseS3:
+        import uuid
+        import boto3
+
+        # Setup
+        s3_client = boto3.client("s3")
+        bucket_name = os.environ["S3_BUCKET_NAME"]
+        output_dir = "/tmp/outputs"
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Prepare lyrics
+        final_lyrics = "[instrumental]" if instrumental else lyrics
+        print(f"Generated lyrics:\n{final_lyrics}")
+        print(f"Prompt: {prompt}")
+
+        # 1. Generate audio
+        print("\nStep 1: Generating audio...")
+        audio_path = os.path.join(output_dir, f"{uuid.uuid4()}.wav")
+
+        self.music_model(
+            prompt=prompt,
+            lyrics=final_lyrics,
+            audio_duration=audio_duration,
+            infer_step=infer_step,
+            guidance_scale=guidance_scale,
+            save_path=audio_path,
+            manual_seeds=str(seed)
+        )
+        print(f"✓ Audio generated: {os.path.getsize(audio_path) / (1024*1024):.2f} MB")
+
+        # 2. Upload audio to S3
+        print("Step 2: Uploading audio to S3...")
+        audio_s3_key = f"{uuid.uuid4()}.wav"
+        s3_client.upload_file(audio_path, bucket_name, audio_s3_key)
+        print(f"✓ Uploaded: s3://{bucket_name}/{audio_s3_key}")
+        os.remove(audio_path)
+
+        # 3. Generate thumbnail
+        print("Step 3: Generating thumbnail...")
+        thumbnail_prompt = f"{prompt}, album cover art"
+        image = self.image_pipe(
+            prompt=thumbnail_prompt,
+            num_inference_steps=2,  # SDXL-Turbo uses 2 steps
+            guidance_scale=0.0       # SDXL-Turbo doesn't use guidance
+        ).images[0]
+
+        image_path = os.path.join(output_dir, f"{uuid.uuid4()}.png")
+        image.save(image_path)
+        print(f"✓ Thumbnail generated: {os.path.getsize(image_path) / 1024:.2f} KB")
+
+        # 4. Upload thumbnail to S3
+        print("Step 4: Uploading thumbnail to S3...")
+        image_s3_key = f"{uuid.uuid4()}.png"
+        s3_client.upload_file(image_path, bucket_name, image_s3_key)
+        print(f"✓ Uploaded: s3://{bucket_name}/{image_s3_key}")
+        os.remove(image_path)
+
+        # 5. Generate categories
+        print("Step 5: Generating categories...")
+        categories = self.generate_categories(description_for_categorization)
+        print(f"✓ Categories: {categories}")
+
+        return GenerateMusicResponseS3(
+            s3_key=audio_s3_key,
+            cover_image_s3_key=image_s3_key,
+            categories=categories
+        )
+
     @modal.method()
     def test_llm_methods(self):
         """Test all LLM helper methods"""
@@ -204,6 +284,46 @@ class MusicGenServer:
 
         print("\n✓✓✓ All LLM tests passed!")
         return True
+
+    @modal.method()
+    def test_full_pipeline(self):
+        """Test complete pipeline"""
+        print("=== Testing Full Pipeline ===\n")
+
+        # Use short duration for testing
+        result = self.generate_and_upload_to_s3(
+            prompt="electronic, upbeat, 120BPM",
+            lyrics="[verse]\nTest lyrics for demo\n[chorus]\nThis is a test",
+            instrumental=False,
+            audio_duration=30.0,  # Short for testing
+            infer_step=60,
+            guidance_scale=15.0,
+            seed=42,
+            description_for_categorization="upbeat electronic dance music"
+        )
+
+        print(f"\n=== Results ===")
+        print(f"Audio S3 key: {result.s3_key}")
+        print(f"Thumbnail S3 key: {result.cover_image_s3_key}")
+        print(f"Categories: {result.categories}")
+
+        # Verify files exist in S3
+        import boto3
+        s3 = boto3.client("s3")
+        bucket = os.environ["S3_BUCKET_NAME"]
+
+        audio_obj = s3.head_object(Bucket=bucket, Key=result.s3_key)
+        thumb_obj = s3.head_object(Bucket=bucket, Key=result.cover_image_s3_key)
+
+        print(f"\nVerification:")
+        print(f"✓ Audio exists in S3: {audio_obj['ContentLength'] / (1024*1024):.2f} MB")
+        print(f"✓ Thumbnail exists in S3: {thumb_obj['ContentLength'] / 1024:.2f} KB")
+
+        assert audio_obj['ContentLength'] > 10000
+        assert thumb_obj['ContentLength'] > 1000
+
+        print("\n✓✓✓ FULL PIPELINE TEST PASSED! ✓✓✓")
+        return result
 
 # Test function
 @app.function(image=image)
@@ -252,3 +372,17 @@ def test_llm():
 
     print("\n=== LLM Testing Complete ===")
     print("You can now proceed to Step 2.3!")
+
+@app.local_entrypoint()
+def test_pipeline():
+    """Test the full pipeline - Step 2.3"""
+    print("=== Testing Full Pipeline (Step 2.3) ===")
+    print("NOTE: This will generate audio, upload to S3, create thumbnails")
+    print("This may take 3-5 minutes for 30s audio\n")
+
+    server = MusicGenServer()
+    server.test_full_pipeline.remote()
+
+    print("\n=== Full Pipeline Testing Complete ===")
+    print("✓ Step 2.3 is now complete!")
+    print("You can now proceed to Phase 3: API Endpoints")
